@@ -1,15 +1,6 @@
 # autoresearch-tabular
 
-This project is an experiment in having the LLM do its own research on tabular feature engineering for a fixed XGBoost benchmark. The data is from a peer-to-peer lender and it includes credit/bureau information about the applicants. 
-
-The benchmark is now:
-
-- binary classification only
-- one prepared dataset only
-- one fixed XGBoost training setup
-- validation AUC as the main optimization target
-
-The editable surface is feature engineering.
+This is an experiment to have the LLM do its own research on tabular XGBoost training. The data is from a peer-to-peer lender and it includes credit/bureau information about the applicants. 
 
 ## Setup
 
@@ -21,54 +12,41 @@ To set up a new experiment, work with the user to:
 2. Create a fresh branch.
    Use `autoresearch/<tag>` from the current working branch unless the human says otherwise.
 
-3. Read the in-scope files for context:
-   - `README.md`
-   - `prepare.py`
-   - `train.py`
+3. Read the in-scope files for full context:
+   - `README.md` for repository context
+   - `prepare.py` for the fixed benchmark setup, data prep, and metric
+   - `train.py` for the editable experiment code
 
-4. Verify the dataset file exists.
-   The current default dataset is:
+4. Verify the dataset cache exists.
+   Check whether `~/.cache/autoresearch-tabular/` already contains `dataset.npz`.
+   If not, tell the human to run `python prepare.py`.
 
-```text
-prosper_full_dataset.parquet.gzip
-```
+5. Initialize `results.tsv`.
+   If starting a fresh experiment branch, reset it to just the header row.
 
-5. Rebuild or verify the prepared cache.
-   The current workflow expects a local cache such as:
-
-```bash
-python prepare.py --cache-dir .cache/autoresearch-glm --dataset-path prosper_full_dataset.parquet.gzip
-```
-
-6. Initialize `results.tsv` if this is a fresh experiment branch.
-   Reset it to just the header row.
+6. Create a `logs/` directory if it does not already exist.
+   Keep one raw stdout/stderr log per experiment run in that folder.
 
 7. Confirm setup looks good, then begin experimentation.
-
 
 ## Experimentation
 
 Each experiment is one run of:
 
 ```bash
-python train.py --cache-dir .cache/autoresearch-tabular --dataset-path prosper_full_dataset.parquet.gzip
+python train.py
 ```
 
-For the required first baseline only, run:
+For the required untuned first baseline only, run:
 
 ```bash
-python train.py --baseline --cache-dir .cache/autoresearch-tabular --dataset-path prosper_full_dataset.parquet.gzip
+python train.py --baseline
 ```
 
-The script evaluates feature-engineering policies with a fixed XGBoost model and prints:
-
-1. one-line trial summaries
-2. a line indicating whether the saved best-overall engineered dataset was updated
-3. a JSON summary of the best run from that invocation
-4. a final scalar line:
+The script evaluates one current XGBoost training policy and prints a final scalar:
 
 ```text
-val_auc: 0.761768
+val_auc: 0.705643
 ```
 
 Higher is better.
@@ -76,66 +54,34 @@ Higher is better.
 ## What You CAN Do
 
 - Modify `train.py`.
-- Change the feature-engineering search space in `FEATURE_POLICIES`.
-- Adjust:
-  - `screen_k`
-  - `feature_cap`
-  - missing-value handling
-  - missing flags
-  - explicit numeric ratio pairs: for example, ("monthly_debt", "stated_monthly_income")
-  - explicit numeric multiply pairs: for example, ("util_open_cc_trds_12m", "avg_bal_all_cc_trds_0_12m")
-- Explore as many reasonable pairs as possible based on variable names and their implications in credit/bureau data.
-- Simplify the feature-engineering logic if AUC holds up or improves.
-- Improve train-only screening and train-only feature selection logic, as long as it stays benchmark-safe.
+- Change/add the current training policy in code:
+  - imbalance handling
+  - sampling strategy (e.g., undersampling, oversampling, etc.)
+  - `scale_pos_weight` and controlled combinations of weighting with mild resampling
+  - XGBoost hyperparameters
+  - broader hyperparameter candidate sets when the current search space looks too narrow
+  - post-fit feature reduction
+  - feature caps
+- Simplify code if the metric holds up or improves.
 
 ## What You CANNOT Do
 
-- Do not modify prepare.py except to fix a real bug in the fixed benchmark setup.
-- Do not change the dataset file, target definition, or metric definition.
-- Do not change the split policy unless the human explicitly asks for a benchmark change.
+- Do not modify `prepare.py` except to fix a real bug in the fixed benchmark setup.
+- Do not modify the split assignments, benchmark dataset, or metric definition.
 - Do not add new packages or dependencies.
 - Do not turn this repo into a general AutoML framework or config system.
-- Do not introduce other modeling families.
-- Do not turn this into broad XGBoost hyperparameter search.
-
+- Do not convert `train.py` into an internal sweep over many unrelated modeling families. It must represent one current policy.
 
 ## Objective
 
-The goal is to get the highest validation AUC on the fixed benchmark by improving feature engineering.
+The goal is simple: get the highest validation AUC on the fixed Prosper benchmark. The agent should run at least 10 experiments unless the human explicitly stops it.
 
-The agent should run at least 10 experiments unless the human explicitly stops it.
+The benchmark is intentionally narrow:
 
-## Feature Engineering Scope
+- binary classification only
+- XGBoost only
+- validation AUC only
 
-The intended search space is numeric feature creation.
-
-Typical directions include:
-
-- better numeric missing-value handling
-- smarter numeric missing flags
-- stronger train-only screening through `screen_k`
-- better final engineered-feature caps through `feature_cap`
-- explicit derived features from selected numeric pairs
-- simpler feature sets with equal or better AUC
-
-Good feature-engineering ideas:
-
-- raw numeric features
-- ratio features between meaningful numerator / denominator pairs
-- multiply / interaction features between related exposure and severity variables
-- division features that turn counts into rough rates
-- train-only filtering of which numeric variables are allowed into pair generation
-
-Implementation note:
-
-- pair lists should usually be edited through named constants such as `RATIO_PAIRS` and `MULTIPLY_PAIRS`
-- new features must be fit using train-derived statistics and then applied consistently to `val`, `test`, and `oot`
-
-Bad directions:
-
-- leakage tricks
-- benchmark-specific hacks that peek across splits
-- turning feature engineering into a broad modeling sweep
 
 ## Simplicity Criterion
 
@@ -148,60 +94,74 @@ When deciding whether to keep a change, weigh:
 
 - magnitude of AUC improvement
 - code complexity added
-- interpretability of the resulting feature-engineering policy
+- interpretability of the resulting training policy
 
-Readable, compact feature logic is preferred over clever machinery.
+Readable, compact training logic is preferred over clever machinery.
+
+## Search Expansion
+
+As the experiment progresses, it is good to expand the search process in targeted ways when the current policy is too narrow.
+
+Useful expansions include:
+
+- more nuanced class-imbalance handling, including searching `scale_pos_weight`
+- controlled combinations of mild undersampling with weighting, when that remains readable and benchmark-oriented
+- smarter local hyperparameter refinement around winning regions, especially for plausible shallow-tree settings
+
+Do not stay trapped in one tiny neighborhood for too long.
+
+After several local follow-up experiments, deliberately reopen the search across the main policy axes again, including:
+
+- `FEATURE_CAPS`
+- `SAMPLING_PLANS`
+- class-weighting choices
+- `HYPERPARAM_GRID`
+
+Use local refinement when a region looks promising, but periodically return to broader exploration so the search does not collapse into repeated tiny nudges around one incumbent.
+
+The goal is to spend more of the fixed budget around credible candidate neighborhoods without turning the script into a large opaque search framework.
 
 ## The First Run
 
-The first run should always establish the pure baseline first.
+The first run should always establish a pure baseline first.
 
 That baseline should be:
 
-- the dedicated `--baseline` path in `train.py`
-- one fixed XGBoost fit
-- raw split-dataset numeric and bool columns only
-- no feature-policy sweep beyond that baseline path
+- no sampling
+- no hyperparameter search
+- no feature pruning
+- one plain XGBoost fit on the prepared benchmark
 
-Use:
+Use the dedicated baseline path in `train.py` for that first run:
 
 ```bash
-python train.py --baseline --cache-dir .cache/autoresearch-glm --dataset-path prosper_full_dataset.parquet.gzip
+python train.py --baseline
 ```
 
-Log that pure baseline in the first data line of `results.tsv`.
+Log that pure run as the baseline in the first data line of `results.tsv`, before any tuned or feature-selected experiments.
+
+After the baseline is established, do not keep rerunning a separate plain-baseline trial inside every future experiment run just to recreate the same reference point.
 
 ## Output Format
 
 When `train.py` finishes, it prints:
 
-1. one-line trial summaries, one per feature-engineering policy evaluated
-2. a status line of the form:
+1. one-line trial summaries
+2. a JSON summary
+3. a final line of the form:
 
 ```text
-saved_overall_best_dataset: .cache/autoresearch-glm/best_overall_engineered_dataset.parquet.gzip updated=1
+val_auc: 0.705643
 ```
 
-3. a JSON summary for the best policy from that run
-4. a final line of the form:
-
-```text
-val_auc: 0.761768
-```
-
-Use the final `val_auc:` line as the ground-truth metric for the experiment.
-
-`train.py` also maintains a persistent best-overall engineered dataset artifact at:
-
-```text
-.cache/autoresearch-glm/best_overall_engineered_dataset.parquet.gzip
-```
-
-That artifact is overwritten only when a run achieves a strictly better validation AUC than the currently saved best.
+Use the final `val_auc:` line as the ground-truth experiment metric.
 
 ## Logging Results
 
-When an experiment is done, log it to `results.tsv`.
+When an experiment is done:
+
+- save the raw run output to `logs/<run-name>.log`
+- log the structured result to `results.tsv`
 
 Use tab-separated format, not commas.
 
@@ -214,52 +174,59 @@ commit	val_auc	initial_val_auc	test_auc	oot_auc	num_features	class_balance	statu
 Columns:
 
 1. short git commit hash
-2. validation AUC of the winning policy from that run, or `0.000000` for crashes
-3. same as the winning run's `initial_val_auc`, or `0.000000` for crashes
+2. post-reduction validation AUC, or `0.000000` for crashes
+3. initial full-model validation AUC before feature reduction, or `0.000000` for crashes
 4. test AUC, or `0.000000` for crashes
-5. OOT AUC, or `0.000000` for crashes
-6. number of final engineered features, or `0` for crashes
+5. out-of-time AUC, or `0.000000` for crashes
+6. number of retained features in the final model, or `0` for crashes
 7. class balance used for model fitting as `pos%/neg%`, or `0%/0%` for crashes
 8. status: `keep`, `discard`, or `crash`
-9. short description of the feature-engineering change
+9. short description of what the experiment changed
 
 Interpretation note:
 
-- `initial_val_auc` is still emitted by `train.py`, and with the current fixed-model numeric-FE setup it is normally equal to `val_auc`.
-- The project-level baseline reference should come from the first logged baseline run.
+- `initial_val_auc` is a per-run metric for that run's full model before feature reduction.
+- The project-level baseline reference should come from the first logged pure-baseline result.
 
 Example:
 
 ```text
 commit	val_auc	initial_val_auc	test_auc	oot_auc	num_features	class_balance	status	description
-a1b2c3d	0.674828	0.674828	0.676463	0.601934	248	5.16%/94.84%	keep	baseline raw numeric and bool split-dataset features
-b2c3d4e	0.689102	0.689102	0.667421	0.593004	264	5.16%/94.84%	keep	add debt burden and utilization ratio pairs
-c3d4e5f	0.686740	0.686740	0.665812	0.590221	280	5.16%/94.84%	discard	add broad multiply interactions with weaker signal
-d4e5f6g	0.000000	0.000000	0.000000	0.000000	0	0%/0%	crash	bad division pair produced broken experiment logic
+a1b2c3d	0.705643	0.711142	0.695347	0.612734	128	5.16%/94.84%	keep	baseline xgboost with post-fit pruning
+b2c3d4e	0.709118	0.706420	0.698551	0.618024	96	13.04%/86.96%	keep	tighter retained feature cap after undersampling
+c3d4e5f	0.701004	0.704331	0.691770	0.609512	64	20.00%/80.00%	discard	more aggressive oversampling with same tree depth
+d4e5f6g	0.000000	0.000000	0.000000	0.000000	0	0%/0%	crash	broken feature-importance pruning logic
 ```
+
+`results.tsv` is a tracked artifact in this fork. Keep it updated as the experiment log, but prefer to checkpoint log-only changes separately from the code-change commits that are being evaluated.
+
+`logs/` should be kept as the raw execution record for experiments. Use unique filenames so each run keeps its own stdout/stderr trace instead of overwriting an earlier run.
 
 ## The Experiment Loop
 
-The experiment runs on the current branch unless the human says otherwise.
+The experiment runs on a dedicated branch such as `autoresearch/mar13`.
 
 Loop:
 
 1. Check the current git state.
-2. Edit `train.py` with one concrete feature-engineering idea.
+2. Edit `train.py` with one experimental idea and each run should represent one narrower experimental idea.
 3. Commit the change.
 4. Run:
 
-For the first baseline only:
+For the first untuned baseline only:
 
 ```bash
-python train.py --baseline --cache-dir .cache/autoresearch-glm --dataset-path prosper_full_dataset.parquet.gzip > logs/<run-name>.log 2>&1
+python train.py --baseline > logs/<run-name>.log 2>&1
 ```
 
-For later experiments:
+For all later tuned experiments:
 
 ```bash
-python train.py --cache-dir .cache/autoresearch-glm --dataset-path prosper_full_dataset.parquet.gzip > logs/<run-name>.log 2>&1
+python train.py > logs/<run-name>.log 2>&1
 ```
+
+Use a unique log filename for each experiment run so previous trial output is preserved.
+Examples: `logs/001-baseline.log`, `logs/002-undersample12.log`.
 
 5. Read out the metric:
 
@@ -275,42 +242,85 @@ tail -n 50 logs/<run-name>.log
 ```
 
 7. Record the result in `results.tsv`.
-8. If the winning `val_auc` improved, keep the commit and advance.
-9. If it is equal or worse, revert to the previous good commit unless the human wants to keep the exploratory branch state.
+8. If `val_auc` improved, keep the commit and advance.
+9. If `val_auc` is equal or worse, revert to the previous good commit.
 
-Do not spend too many consecutive runs only tweaking one tiny corner of the same idea.
+Do not spend too many consecutive runs only tweaking one narrow neighborhood.
+
+If recent runs are all minor local variations, the next run should broaden the search again by changing one of the major policy axes:
+
+- feature caps
+- sampling plans
+- weighting behavior
+- hyperparameter sets
+
+The intended rhythm is:
+
+- broad exploration to identify credible regions
+- local refinement around winners
+- then broad exploration again when refinement stops yielding clear gains
 
 
 ## Never Stop Rule
 
-Once setup is complete, do not stop after a single successful run.
+Once setup is complete, do not stop after a single successful run. 
 
 Keep cycling through the experiment loop until one of these is true:
 
 1. the human explicitly tells you to stop
 2. you hit a real blocker that you cannot resolve from within the repo
-3. repeated attempts stop producing credible new feature-engineering ideas
+3. repeated attempts stop producing credible new ideas
 
 Do not stop just because:
 
 - you found one improvement
 - you found a new best result
-- one idea failed
-- one run crashed
+- you hit a crash once
+- an idea failed
+- a new best reproduced once
 
 If an experiment fails, revert, log it, and try the next concrete idea.
 If an experiment succeeds, keep it and immediately look for the next plausible improvement.
+Momentum matters more than commentary.
 
 ## Crash Policy
 
 If a run crashes because of a small bug, fix it and retry.
 If the idea itself is broken, log it as `crash`, revert, and move on.
 
+
+## Hyperparameter Search Expectation
+
+Do not keep the hyperparameter search space artificially tiny.
+
+If the current `train.py` only tries a small handful of XGBoost settings, expand it with more plausible candidates.
+
+That can include variation in:
+
+- learning rate
+- max depth
+- min child weight
+- subsample
+- column subsample
+- L1 and L2 regularization
+- early stopping / boosting round behavior
+- number of estimators
+
+Keep the search compact enough to remain readable and benchmark-oriented, but large enough that it represents a real attempt at hyperparameter exploration rather than a token sweep.
+
+Bad directions:
+
+- giant search frameworks
+- excessive infrastructure
+- opaque abstractions
+- dataset-specific leakage tricks
+- edits that game the split or metric
+
 ## Operating Mode
 
-You are acting like an autonomous researcher within a narrow benchmark.
+You are acting like an autonomous researcher.
 
 Do not pause after every run to ask whether you should continue.
 Keep iterating until the human interrupts you.
 
-If you feel stuck, reread `README.md`, `prepare.py`, and `train.py`, then try another concrete feature-engineering idea.
+If you feel stuck, reread `README.md`, `prepare.py`, and `train.py`, then try another concrete idea.

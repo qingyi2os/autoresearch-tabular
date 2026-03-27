@@ -85,37 +85,6 @@ def load_modeling_frame(
     return frame, x_frame, y, PROSPER_TARGET
 
 
-def column_type_groups(frame: pd.DataFrame) -> dict[str, list[str]]:
-    bool_cols = frame.select_dtypes(include=["bool"]).columns.tolist()
-    datetime_cols = frame.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
-    numeric_cols = [col for col in frame.select_dtypes(include=["number"]).columns.tolist() if col not in bool_cols]
-    categorical_cols = [
-        col
-        for col in frame.columns
-        if col not in set(bool_cols) | set(datetime_cols) | set(numeric_cols)
-    ]
-    return {
-        "numeric": numeric_cols,
-        "bool": bool_cols,
-        "categorical": categorical_cols,
-        "datetime": datetime_cols,
-    }
-
-
-def detect_time_column(frame: pd.DataFrame) -> str | None:
-    datetime_cols = frame.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
-    if not datetime_cols:
-        return None
-
-    preferred = ["timestamp", "event_timestamp", "event_date", "date", "origination_date"]
-    lowered = {col.lower(): col for col in datetime_cols}
-    for name in preferred:
-        if name in lowered:
-            return lowered[name]
-
-    return datetime_cols[0]
-
-
 def split_indices_from_column(split_values: pd.Series) -> dict[str, np.ndarray]:
     normalized = split_values.astype(str).str.strip().str.lower()
     return {split_name: np.flatnonzero(normalized == split_name) for split_name in SPLIT_NAMES}
@@ -130,9 +99,6 @@ def prepare_dataset(
 
     frame, x_frame, _, target_column = load_modeling_frame(dataset_path=dataset_path)
     split_indices = split_indices_from_column(frame[SPLIT_COLUMN])
-    type_groups = column_type_groups(x_frame)
-    time_column = detect_time_column(x_frame)
-
     np.savez_compressed(
         cache_dir / DATASET_CACHE_FILENAME,
         **{f"{split_name}_idx": split_indices[split_name] for split_name in SPLIT_NAMES},
@@ -151,8 +117,6 @@ def prepare_dataset(
         "dataset_path": str(dataset_path),
         "source": "prosper",
         "split_source": PROVIDED_SPLIT_SOURCE,
-        "time_column": time_column,
-        "column_types": {name: len(columns) for name, columns in type_groups.items()},
         "splits": {split_name: int(len(split_indices[split_name])) for split_name in SPLIT_NAMES},
     }
     (cache_dir / META_FILENAME).write_text(json.dumps(meta, indent=2) + "\n")
@@ -172,8 +136,6 @@ def load_dataset(cache_dir: Path | None = None) -> dict:
         feature_names = dataset["feature_names"].tolist()
         feature_dtypes = dataset["feature_dtypes"].tolist()
     _, x_frame, y, target_column = load_modeling_frame(dataset_path=Path(meta["dataset_path"]))
-    type_groups = column_type_groups(x_frame)
-
     return {
         "frame_train": x_frame.iloc[split_indices[TRAIN_SPLIT]].reset_index(drop=True),
         "y_train": y[split_indices[TRAIN_SPLIT]].astype(np.int64),
@@ -185,10 +147,8 @@ def load_dataset(cache_dir: Path | None = None) -> dict:
         "y_oot": y[split_indices[OOT_SPLIT]].astype(np.int64),
         "feature_names": feature_names,
         "feature_dtypes": feature_dtypes,
-        "column_types": type_groups,
         "target_column": target_column,
         "split_source": meta["split_source"],
-        "time_column": meta.get("time_column"),
     }
 
 

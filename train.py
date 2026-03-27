@@ -1,7 +1,7 @@
 import argparse
+import hashlib
 import json
 import time
-from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -11,224 +11,113 @@ import xgboost as xgb
 from prepare import TIME_BUDGET, auc_score, load_dataset
 
 RANDOM_SEED = 1337
+MAX_TRIALS = 120
+SEARCH_TIME_BUDGET = max(TIME_BUDGET, 600.0)
+NUM_BOOST_ROUND = 400
 EARLY_STOPPING_ROUNDS = 30
 LOCAL_CACHE_DIR = Path(".cache") / "autoresearch-tabular"
-DEFAULT_OVERALL_BEST_DATASET_PATH = LOCAL_CACHE_DIR / "best_overall_engineered_dataset.parquet.gzip"
 
-FIXED_XGB_PARAMS = {
-    "eta": 0.3,
-    "max_depth": 6,
+BASELINE_PARAMS = {
+    "eta": 0.10,
+    "max_depth": 3,
     "min_child_weight": 1.0,
     "subsample": 1.0,
     "colsample_bytree": 1.0,
-    "gamma": 0.0,
     "reg_lambda": 1.0,
     "reg_alpha": 0.0,
-    "scale_pos_weight": 1.0,
-    "n_estimators": 100,
+    "n_estimators": 400,
 }
 
-FEATURE_POLICY_BASE = {
-    "screen_k": None,
-    "feature_cap": None,
-    "include_raw_numeric": True,
-    "ratio_pairs": (),
-    "multiply_pairs": (),
-    "add_numeric_missing_flags": True,
-}
-
-STARTING_RATIO_PAIRS = (
-    ("tot_mthly_obligation_accts_3m", "tot_pymt_amount_accts_3m"),
-    ("tot_bal_bc_accts_3m", "tot_pymt_amount_bc_accts_3m"),
-    ("tot_mthly_obligation_bc_accts_3m", "tot_pymt_amount_bc_accts_3m"),
-    ("tot_bal_bc_accts_3m", "tot_mthly_obligation_bc_accts_3m"),
-    ("tot_sched_mthly_pymt_open_mtg_trds_12m", "tot_sched_mthly_pymt_all_trds_12m"),
-)
-
-STARTING_MULTIPLY_PAIRS = (
-    ("num_open_sat_inst_trds_24m_plus", "tot_sched_mthly_pymt_open_inst_trds_12m"),
-)
-
-BURDEN_RATIO_PAIRS = (
-    ("monthly_debt", "stated_monthly_income"),
-    ("tot_sched_mthly_pymt_all_trds_12m", "stated_monthly_income"),
-    ("tot_sched_mthly_pymt_open_mtg_trds_12m", "stated_monthly_income"),
-    ("tot_sched_mthly_pymt_open_inst_trds_12m", "stated_monthly_income"),
-    ("revolving_balance", "stated_monthly_income"),
-)
-
-BURDEN_MULTIPLY_PAIRS = (
-    ("util_open_cc_trds_12m", "avg_bal_all_cc_trds_0_12m"),
-    ("num_deduped_inq_12m", "monthly_debt"),
-)
-
-HYBRID_RATIO_PAIRS = BURDEN_RATIO_PAIRS + (
-    ("tot_sched_mthly_pymt_open_mtg_trds_12m", "tot_sched_mthly_pymt_all_trds_12m"),
-)
-
-HYBRID_MULTIPLY_PAIRS = (
-    ("util_open_cc_trds_12m", "avg_bal_all_cc_trds_0_12m"),
-)
-
-
-FEATURE_POLICIES = [
+FEATURE_CAPS = [136]
+HYPERPARAM_GRID = [
     {
-        **FEATURE_POLICY_BASE,
-        "name": "starting_mtg_share_plus_inst_scale_mul",
-        "ratio_pairs": STARTING_RATIO_PAIRS,
-        "multiply_pairs": STARTING_MULTIPLY_PAIRS,
-    },
-    {
-        **FEATURE_POLICY_BASE,
-        "name": "burden_pairs_cap192_nomiss",
-        "ratio_pairs": BURDEN_RATIO_PAIRS,
-        "multiply_pairs": BURDEN_MULTIPLY_PAIRS,
-        "feature_cap": 192,
-        "add_numeric_missing_flags": False,
+        "eta": 0.095,
+        "max_depth": 3,
+        "min_child_weight": 7.0,
+        "subsample": 0.95,
+        "colsample_bytree": 0.95,
+        "reg_lambda": 2.0,
+        "reg_alpha": 0.0,
+        "n_estimators": 550,
     },
 ]
+SAMPLING_PLANS = [
+    {"name": "none", "target_pos_rate": None, "scale_pos_weight_mode": "none"},
+]
 
-BASELINE_NAME = "split_dataset_raw"
-
-
-# Helpers
-
-def safe_corr(x: np.ndarray, y: np.ndarray) -> float:
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if mask.sum() < 2:
-        return 0.0
-    x = x[mask]
-    y = y[mask]
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = np.sqrt((x @ x) * (y @ y))
-    if denom <= 1e-12:
-        return 0.0
-    return float(abs((x @ y) / denom))
+BASELINE_SAMPLING = {"name": "none", "target_pos_rate": None, "scale_pos_weight_mode": "none"}
+NAT_SENTINEL = np.iinfo("int64").min
 
 
-# Feature matrix helpers
+# Data helpers
 
-def append_feature(
-    parts: list[list[np.ndarray]],
-    arrays: list[np.ndarray],
-    feature_names: list[str],
-    name: str,
-) -> None:
-    for frame_parts, array in zip(parts, arrays, strict=True):
-        frame_parts.append(array.astype(np.float64, copy=False))
-    feature_names.append(name)
-
-
-def score_numeric_column(series: pd.Series, y_train: np.ndarray) -> float:
-    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
-    missing = np.isnan(values)
-    score = 0.0
-    if np.any(missing):
-        score = max(score, safe_corr(missing.astype(np.float64), y_train))
-    finite = np.isfinite(values)
-    if not np.any(finite):
-        return score
-    median = float(np.nanmedian(values[finite]))
-    filled = np.where(missing, median, values)
-    return max(score, safe_corr(filled, y_train))
+def frame_to_matrix(frame: pd.DataFrame) -> np.ndarray:
+    arrays = []
+    for _, series in frame.items():
+        if np.issubdtype(series.dtype, np.datetime64):
+            ints = series.astype("int64", copy=False).to_numpy()
+            values = ints.astype(np.float64, copy=False)
+            values[ints == NAT_SENTINEL] = np.nan
+        else:
+            values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        arrays.append(values)
+    return np.column_stack(arrays).astype(np.float64, copy=False)
 
 
-def apply_feature_cap(
-    matrices: list[np.ndarray],
+def load_arrays(cache_dir: Path | None = None) -> dict:
+    dataset = load_dataset(cache_dir=cache_dir)
+    return {
+        "x_train": frame_to_matrix(dataset["frame_train"]),
+        "y_train": dataset["y_train"],
+        "x_val": frame_to_matrix(dataset["frame_val"]),
+        "y_val": dataset["y_val"],
+        "x_test": frame_to_matrix(dataset["frame_test"]),
+        "y_test": dataset["y_test"],
+        "x_oot": frame_to_matrix(dataset["frame_oot"]),
+        "y_oot": dataset["y_oot"],
+        "feature_names": dataset["feature_names"],
+    }
+
+
+# Sampling helpers
+
+def balanced_weight(y: np.ndarray) -> float:
+    positives = max(float(y.sum()), 1.0)
+    negatives = max(float(len(y) - y.sum()), 1.0)
+    return negatives / positives
+
+
+def resample_training_data(
+    x_train: np.ndarray,
     y_train: np.ndarray,
-    feature_names: list[str],
-    feature_cap: int | None,
-) -> tuple[list[np.ndarray], list[str], list[float]]:
-    num_features = matrices[0].shape[1]
-    scores = [safe_corr(matrices[0][:, idx], y_train) for idx in range(num_features)]
-    if feature_cap is None or feature_cap <= 0 or num_features <= feature_cap:
-        return matrices, feature_names, scores
+    method: str,
+    target_pos_rate: float | None,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if method == "none" or target_pos_rate is None:
+        return x_train, y_train
+    if not method.startswith("undersample"):
+        raise ValueError(f"Unknown sampling method: {method}")
 
-    ranked_idx = sorted(range(num_features), key=lambda idx: (-scores[idx], feature_names[idx]))
-    selected_idx = ranked_idx[:feature_cap]
-    selected_idx.sort()
-    capped_matrices = [matrix[:, selected_idx] for matrix in matrices]
-    capped_names = [feature_names[idx] for idx in selected_idx]
-    capped_scores = [scores[idx] for idx in selected_idx]
-    return capped_matrices, capped_names, capped_scores
+    rng = np.random.default_rng(seed)
+    pos_idx = np.flatnonzero(y_train == 1)
+    neg_idx = np.flatnonzero(y_train == 0)
+    if len(pos_idx) == 0 or len(neg_idx) == 0:
+        return x_train, y_train
 
-
-def build_numeric_features(
-    train_frame: pd.DataFrame,
-    other_frames: list[pd.DataFrame],
-    columns: list[str],
-    feature_policy: dict,
-    excluded_raw_columns: set[str],
-    parts: list[list[np.ndarray]],
-    feature_names: list[str],
-) -> None:
-    all_frames = [train_frame, *other_frames]
-    for column in columns:
-        series_list = [pd.to_numeric(frame[column], errors="coerce") for frame in all_frames]
-        train_values = series_list[0].to_numpy(dtype=np.float64, na_value=np.nan)
-        exclude_raw_column = column in excluded_raw_columns
-
-        if feature_policy["add_numeric_missing_flags"] and not exclude_raw_column:
-            missing_flags = [series.isna().to_numpy(dtype=np.float64) for series in series_list]
-            if np.any(missing_flags[0]):
-                append_feature(
-                    parts,
-                    missing_flags,
-                    feature_names,
-                    f"{column}__missing",
-                )
-
-        finite_train = train_values[np.isfinite(train_values)]
-        fill_value = float(np.nanmedian(finite_train)) if len(finite_train) else 0.0
-        arrays = [series.fillna(fill_value).to_numpy(dtype=np.float64) for series in series_list]
-        if feature_policy["include_raw_numeric"] and not exclude_raw_column:
-            append_feature(
-                parts,
-                arrays,
-                feature_names,
-                column,
-            )
+    target_neg = int(round(len(pos_idx) * (1.0 - target_pos_rate) / target_pos_rate))
+    target_neg = min(len(neg_idx), max(target_neg, len(pos_idx)))
+    chosen_neg = rng.choice(neg_idx, size=target_neg, replace=False)
+    chosen = rng.permutation(np.concatenate([pos_idx, chosen_neg]))
+    return x_train[chosen], y_train[chosen]
 
 
-def numeric_combo_arrays(
-    train_frame: pd.DataFrame,
-    other_frames: list[pd.DataFrame],
-    left_column: str,
-    right_column: str,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    all_frames = [train_frame, *other_frames]
-    left_series_list = [pd.to_numeric(frame[left_column], errors="coerce") for frame in all_frames]
-    right_series_list = [pd.to_numeric(frame[right_column], errors="coerce") for frame in all_frames]
-
-    left_train = left_series_list[0].to_numpy(dtype=np.float64, na_value=np.nan)
-    right_train = right_series_list[0].to_numpy(dtype=np.float64, na_value=np.nan)
-    left_fill = float(np.nanmedian(left_train[np.isfinite(left_train)])) if np.isfinite(left_train).any() else 0.0
-    right_fill = float(np.nanmedian(right_train[np.isfinite(right_train)])) if np.isfinite(right_train).any() else 0.0
-
-    left_arrays = [series.fillna(left_fill).to_numpy(dtype=np.float64) for series in left_series_list]
-    right_arrays = [series.fillna(right_fill).to_numpy(dtype=np.float64) for series in right_series_list]
-    return left_arrays, right_arrays
-
-
-def divide_feature_arrays(
-    numerator_arrays: list[np.ndarray],
-    denominator_arrays: list[np.ndarray],
-    eps: float = 1e-6,
-) -> list[np.ndarray]:
-    outputs: list[np.ndarray] = []
-    for numerator, denominator in zip(numerator_arrays, denominator_arrays, strict=True):
-        safe_denominator = np.where(np.abs(denominator) < eps, np.nan, denominator)
-        divided = np.divide(
-            numerator,
-            safe_denominator,
-            out=np.zeros_like(numerator, dtype=np.float64),
-            where=np.isfinite(safe_denominator),
-        )
-        outputs.append(np.nan_to_num(divided, nan=0.0, posinf=0.0, neginf=0.0))
-    return outputs
+def effective_scale_pos_weight(mode: str, y_train: np.ndarray) -> float:
+    if mode == "none":
+        return 1.0
+    if mode == "sqrt_balanced":
+        return max(balanced_weight(y_train) ** 0.5, 1.0)
+    raise ValueError(f"Unknown scale_pos_weight mode: {mode}")
 
 
 # Model helpers
@@ -238,25 +127,32 @@ def fit_xgboost(
     y_train: np.ndarray,
     x_val: np.ndarray,
     y_val: np.ndarray,
+    params: dict,
+    scale_pos_weight: float = 1.0,
+    max_delta_step: float | None = 1.0,
 ) -> tuple[xgb.Booster, dict]:
-    train_dmatrix = xgb.DMatrix(x_train, label=y_train)
-    val_dmatrix = xgb.DMatrix(x_val, label=y_val)
-    train_params = dict(FIXED_XGB_PARAMS)
-    num_boost_round = int(train_params.pop("n_estimators"))
+    train_params = dict(params)
+    num_boost_round = int(train_params.pop("n_estimators", NUM_BOOST_ROUND))
+    booster_params = {
+        "objective": "binary:logistic",
+        "eval_metric": "auc",
+        "tree_method": "hist",
+        "seed": RANDOM_SEED,
+        "scale_pos_weight": scale_pos_weight,
+        **train_params,
+    }
+    if max_delta_step is not None:
+        booster_params["max_delta_step"] = max_delta_step
 
     evals_result: dict = {}
     booster = xgb.train(
-        params={
-            "objective": "binary:logistic",
-            "eval_metric": "auc",
-            "tree_method": "hist",
-            "seed": RANDOM_SEED,
-            "max_delta_step": 1.0,
-            **train_params,
-        },
-        dtrain=train_dmatrix,
+        params=booster_params,
+        dtrain=xgb.DMatrix(x_train, label=y_train),
         num_boost_round=num_boost_round,
-        evals=[(train_dmatrix, "train"), (val_dmatrix, "val")],
+        evals=[
+            (xgb.DMatrix(x_train, label=y_train), "train"),
+            (xgb.DMatrix(x_val, label=y_val), "val"),
+        ],
         early_stopping_rounds=EARLY_STOPPING_ROUNDS,
         verbose_eval=False,
         evals_result=evals_result,
@@ -265,361 +161,265 @@ def fit_xgboost(
 
 
 def predict_scores(booster: xgb.Booster, x: np.ndarray) -> np.ndarray:
-    dmatrix = xgb.DMatrix(x)
     best_iteration = getattr(booster, "best_iteration", None)
     if best_iteration is None:
-        return booster.predict(dmatrix)
-    return booster.predict(dmatrix, iteration_range=(0, best_iteration + 1))
+        return booster.predict(xgb.DMatrix(x))
+    return booster.predict(xgb.DMatrix(x), iteration_range=(0, best_iteration + 1))
 
 
-# Feature engineering
+def select_top_features(
+    booster: xgb.Booster,
+    num_features: int,
+    feature_cap: int | None,
+) -> tuple[list[int], list[float]]:
+    gain_scores = booster.get_score(importance_type="gain")
+    importance = [float(gain_scores.get(f"f{idx}", 0.0)) for idx in range(num_features)]
+    if feature_cap is None or feature_cap >= num_features:
+        return list(range(num_features)), importance
+
+    ranked_idx = sorted(range(num_features), key=lambda idx: (-importance[idx], idx))
+    selected_idx = ranked_idx[:feature_cap]
+    return selected_idx, [importance[idx] for idx in selected_idx]
 
 
-def build_pair_features(
-    train_frame: pd.DataFrame,
-    other_frames: list[pd.DataFrame],
-    variable_combinations: list[tuple[str, str]],
-    parts: list[list[np.ndarray]],
-    feature_names: list[str],
-    suffix: str,
-    combine_arrays: Callable[[list[np.ndarray], list[np.ndarray]], list[np.ndarray]],
-) -> None:
-    for left_column, right_column in variable_combinations:
-        left_arrays, right_arrays = numeric_combo_arrays(
-            train_frame=train_frame,
-            other_frames=other_frames,
-            left_column=left_column,
-            right_column=right_column,
-        )
-        pair_arrays = combine_arrays(left_arrays, right_arrays)
-        append_feature(
-            parts,
-            pair_arrays,
-            feature_names,
-            f"{left_column}__{suffix}__{right_column}",
-        )
+# Search helpers
 
-
-def engineer_feature_views(dataset: dict, feature_policy: dict) -> dict:
-    train_frame = dataset["frame_train"]
-    other_frames = [dataset["frame_val"], dataset["frame_test"], dataset["frame_oot"]]
-    frames = [train_frame, *other_frames]
-    numeric_columns = list(dataset["column_types"]["numeric"])
-    raw_scores = {
-        column: score_numeric_column(train_frame[column], dataset["y_train"])
-        for column in numeric_columns
-    }
-    screen_k = feature_policy["screen_k"]
-    if screen_k is not None and screen_k > 0 and screen_k < len(numeric_columns):
-        ranked = sorted(raw_scores.items(), key=lambda item: (-item[1], item[0]))
-        numeric_columns = [column for column, _ in ranked[:screen_k]]
-
-    numeric_column_set = set(numeric_columns)
-    ratio_pairs = [
-        (left_column, right_column)
-        for left_column, right_column in feature_policy["ratio_pairs"]
-        if left_column in numeric_column_set and right_column in numeric_column_set
-    ]
-    multiply_pairs = [
-        (left_column, right_column)
-        for left_column, right_column in feature_policy["multiply_pairs"]
-        if left_column in numeric_column_set and right_column in numeric_column_set
-    ]
-    paired_columns = {
-        column
-        for left_column, right_column in [*ratio_pairs, *multiply_pairs]
-        for column in (left_column, right_column)
-    }
-
-    parts: list[list[np.ndarray]] = [[] for _ in frames]
-    feature_names: list[str] = []
-
-    build_numeric_features(
-        train_frame=train_frame,
-        other_frames=other_frames,
-        columns=numeric_columns,
-        feature_policy=feature_policy,
-        excluded_raw_columns=paired_columns,
-        parts=parts,
-        feature_names=feature_names,
-    )
-
-    build_pair_features(
-        train_frame=train_frame,
-        other_frames=other_frames,
-        variable_combinations=ratio_pairs,
-        parts=parts,
-        feature_names=feature_names,
-        suffix="ratio",
-        combine_arrays=divide_feature_arrays,
-    )
-    build_pair_features(
-        train_frame=train_frame,
-        other_frames=other_frames,
-        variable_combinations=multiply_pairs,
-        parts=parts,
-        feature_names=feature_names,
-        suffix="mul",
-        combine_arrays=lambda left_arrays, right_arrays: [
-            (left * right).astype(np.float64, copy=False)
-            for left, right in zip(left_arrays, right_arrays, strict=True)
-        ],
-    )
-
-    matrices = []
-    for frame, frame_parts in zip(frames, parts, strict=True):
-        if frame_parts:
-            matrices.append(np.column_stack(frame_parts).astype(np.float64, copy=False))
-        else:
-            matrices.append(np.empty((len(frame), 0), dtype=np.float64))
-
-    matrices, feature_names, engineered_scores = apply_feature_cap(
-        matrices=matrices,
-        y_train=dataset["y_train"],
-        feature_names=feature_names,
-        feature_cap=feature_policy["feature_cap"],
-    )
-
-    return {
-        "x_train": matrices[0],
-        "x_val": matrices[1],
-        "x_test": matrices[2],
-        "x_oot": matrices[3],
-        "feature_names": feature_names,
-        "feature_counts": {
-            "numeric": len(feature_names),
-            "bool": 0,
-            "categorical": 0,
-            "datetime": 0,
+def config_seed(config: dict) -> int:
+    payload = json.dumps(
+        {
+            "feature_cap": config["feature_cap"],
+            "sampling": config["sampling"],
+            "hyperparams": config["hyperparams"],
         },
-        "effective_column_types": {
-            "numeric": list(numeric_columns),
-            "bool": [],
-            "categorical": [],
-            "datetime": [],
-        },
-        "raw_column_scores": raw_scores,
-        "engineered_feature_scores": engineered_scores,
-    }
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return RANDOM_SEED + int(digest[:8], 16)
 
 
-def engineer_baseline_views(dataset: dict) -> dict:
-    numeric_columns = list(dataset["column_types"]["numeric"])
-    bool_columns = list(dataset["column_types"]["bool"])
-    feature_names = [*numeric_columns, *bool_columns]
-    matrices = [
-        np.column_stack(
-            [
-                pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
-                for column in feature_names
-            ]
-        ).astype(np.float64, copy=False)
-        for frame in [
-            dataset["frame_train"],
-            dataset["frame_val"],
-            dataset["frame_test"],
-            dataset["frame_oot"],
-        ]
+def candidate_configs() -> list[dict]:
+    return [
+        {
+            "name": "search",
+            "feature_cap": feature_cap,
+            "sampling": sampling,
+            "hyperparams": hyperparams,
+        }
+        for feature_cap in FEATURE_CAPS
+        for sampling in SAMPLING_PLANS
+        for hyperparams in HYPERPARAM_GRID
     ]
 
-    return {
-        "x_train": matrices[0],
-        "x_val": matrices[1],
-        "x_test": matrices[2],
-        "x_oot": matrices[3],
-        "feature_names": feature_names,
-        "feature_counts": {
-            "numeric": len(numeric_columns),
-            "bool": len(bool_columns),
-            "categorical": 0,
-            "datetime": 0,
-        },
-        "effective_column_types": {
-            "numeric": numeric_columns,
-            "bool": bool_columns,
-            "categorical": [],
-            "datetime": [],
-        },
-        "raw_column_scores": {},
-        "engineered_feature_scores": [
-            safe_corr(matrices[0][:, idx], dataset["y_train"])
-            for idx in range(matrices[0].shape[1])
-        ],
-    }
+
+def class_balance_string(y: np.ndarray) -> str:
+    pos_rate = float(np.mean(y))
+    return f"{pos_rate * 100.0:.2f}%/{(1.0 - pos_rate) * 100.0:.2f}%"
 
 
-# Evaluation
+def describe_feature_cap(feature_cap: int | None) -> str:
+    return "all" if feature_cap is None else str(feature_cap)
 
-def describe_feature_policy(feature_policy: dict) -> str:
+
+def describe_policy(config: dict, num_features: int, scale_pos_weight: float) -> str:
+    hyperparams = config["hyperparams"]
+    sampling = config["sampling"]
+    target_pos_rate = sampling["target_pos_rate"]
+    target_pos_rate_str = "none" if target_pos_rate is None else f"{target_pos_rate:.2f}"
     return (
-        f"fe={feature_policy['name']} "
-        f"screen_k={feature_policy['screen_k']} "
-        f"feature_cap={feature_policy['feature_cap']} "
-        f"raw_numeric={int(feature_policy['include_raw_numeric'])} "
-        f"ratio_pairs={len(feature_policy['ratio_pairs'])} "
-        f"multiply_pairs={len(feature_policy['multiply_pairs'])} "
-        f"missing_flags=num:{int(feature_policy['add_numeric_missing_flags'])}"
+        f"name={config['name']} "
+        f"feature_cap={describe_feature_cap(config['feature_cap'])} "
+        f"num_features={num_features} "
+        f"sampling={sampling['name']} "
+        f"target_pos_rate={target_pos_rate_str} "
+        f"weight={sampling['scale_pos_weight_mode']} "
+        f"scale_pos_weight={scale_pos_weight:.3f} "
+        f"eta={hyperparams['eta']:.3f} "
+        f"max_depth={hyperparams['max_depth']} "
+        f"min_child_weight={hyperparams['min_child_weight']:.1f} "
+        f"subsample={hyperparams['subsample']:.2f} "
+        f"colsample_bytree={hyperparams['colsample_bytree']:.2f} "
+        f"reg_lambda={hyperparams['reg_lambda']:.1f} "
+        f"reg_alpha={hyperparams['reg_alpha']:.1f} "
+        f"n_estimators={int(hyperparams.get('n_estimators', NUM_BOOST_ROUND))}"
     )
 
 
-def evaluate_run(dataset: dict, trial: int, feature_policy: dict | None = None) -> dict:
-    started = time.time()
-    if feature_policy is None:
-        views = engineer_baseline_views(dataset=dataset)
-        policy_label = "baseline=split_dataset_raw numeric+bool_only no_feature_policy"
-        description = "single fixed xgboost on split dataset raw numeric and bool columns only"
-        config = {
-            "name": BASELINE_NAME,
-            "baseline": True,
-            "xgboost_params": FIXED_XGB_PARAMS,
-        }
-    else:
-        views = engineer_feature_views(dataset=dataset, feature_policy=feature_policy)
-        policy_label = describe_feature_policy(feature_policy)
-        description = f"single fixed xgboost with {feature_policy['name']} feature engineering"
-        config = {
-            "name": feature_policy["name"],
-            "feature_policy": feature_policy,
-            "xgboost_params": FIXED_XGB_PARAMS,
-        }
-
-    booster, evals_result = fit_xgboost(
-        x_train=views["x_train"],
-        y_train=dataset["y_train"],
-        x_val=views["x_val"],
-        y_val=dataset["y_val"],
+def summarize_policy(config: dict, num_features: int) -> str:
+    hyperparams = config["hyperparams"]
+    sampling = config["sampling"]["name"]
+    depth = "a shallow tree" if hyperparams["max_depth"] <= 3 else f"depth {hyperparams['max_depth']}"
+    return (
+        f"try {sampling} keep {num_features} features "
+        f"with {depth} eta {hyperparams['eta']:.3f}, "
+        f"min child weight {hyperparams['min_child_weight']:.1f}"
     )
-    val_scores = predict_scores(booster, views["x_val"])
-    test_scores = predict_scores(booster, views["x_test"])
-    oot_scores = predict_scores(booster, views["x_oot"])
-    val_auc = auc_score(dataset["y_val"], val_scores)
-    test_auc = auc_score(dataset["y_test"], test_scores)
-    oot_auc = auc_score(dataset["y_oot"], oot_scores)
-    pos_rate = float(np.mean(dataset["y_train"]))
+
+
+def print_trial(result: dict) -> None:
+    hyperparams = result["config"]["hyperparams"]
+    sampling = result["config"]["sampling"]
+    print(
+        f"trial={result['trial']:02d} val_auc={result['val_auc']:.6f} "
+        f"initial_val_auc={result['initial_val_auc']:.6f} "
+        f"test_auc={result['test_auc']:.6f} oot_auc={result['oot_auc']:.6f} "
+        f"features={result['num_features']:03d} "
+        f"cap={describe_feature_cap(result['config']['feature_cap'])} "
+        f"sampling={sampling['name']} weight={sampling['scale_pos_weight_mode']} "
+        f"depth={hyperparams['max_depth']} eta={hyperparams['eta']:.3f} "
+        f"mcw={hyperparams['min_child_weight']:.1f}"
+    )
+
+
+def trial_signature(config: dict, selected_idx: list[int]) -> tuple:
+    return (
+        tuple(selected_idx),
+        config["sampling"]["name"],
+        config["sampling"]["scale_pos_weight_mode"],
+        tuple(sorted(config["hyperparams"].items())),
+    )
+
+
+# Execution
+
+def run_trial(
+    data: dict,
+    trial: int,
+    config: dict,
+    original_class_balance: str,
+) -> tuple[dict, tuple]:
+    sampled_x, sampled_y = resample_training_data(
+        x_train=data["x_train"],
+        y_train=data["y_train"],
+        method=config["sampling"]["name"],
+        target_pos_rate=config["sampling"]["target_pos_rate"],
+        seed=config_seed(config),
+    )
+    scale_pos_weight = effective_scale_pos_weight(config["sampling"]["scale_pos_weight_mode"], sampled_y)
+    is_baseline = config["name"] == "baseline"
+
+    initial_booster, initial_evals = fit_xgboost(
+        x_train=sampled_x,
+        y_train=sampled_y,
+        x_val=data["x_val"],
+        y_val=data["y_val"],
+        params=config["hyperparams"],
+        scale_pos_weight=scale_pos_weight,
+        max_delta_step=None if is_baseline else 1.0,
+    )
+
+    selected_idx, feature_importance = select_top_features(
+        booster=initial_booster,
+        num_features=data["x_train"].shape[1],
+        feature_cap=config["feature_cap"],
+    )
+    signature = trial_signature(config, selected_idx)
+
+    selected_names = [data["feature_names"][idx] for idx in selected_idx]
+    train_view = data["x_train"][:, selected_idx]
+    val_view = data["x_val"][:, selected_idx]
+    test_view = data["x_test"][:, selected_idx]
+    oot_view = data["x_oot"][:, selected_idx]
+    sampled_view = sampled_x[:, selected_idx]
+
+    booster = initial_booster
+    evals_result = initial_evals
+    if config["feature_cap"] is not None:
+        booster, evals_result = fit_xgboost(
+            x_train=sampled_view,
+            y_train=sampled_y,
+            x_val=val_view,
+            y_val=data["y_val"],
+            params=config["hyperparams"],
+            scale_pos_weight=scale_pos_weight,
+        )
+
+    val_auc = auc_score(data["y_val"], predict_scores(booster, val_view))
+    test_auc = auc_score(data["y_test"], predict_scores(booster, test_view))
+    oot_auc = auc_score(data["y_oot"], predict_scores(booster, oot_view))
+    initial_val_auc = auc_score(data["y_val"], predict_scores(initial_booster, data["x_val"]))
+    policy = describe_policy(config, len(selected_names), scale_pos_weight)
+    description = (
+        "plain xgboost baseline without tuning or feature pruning"
+        if is_baseline
+        else summarize_policy(config, len(selected_names))
+    )
+    sampled_class_balance = class_balance_string(sampled_y)
 
     result = {
         "trial": trial,
         "val_auc": val_auc,
-        "initial_val_auc": val_auc,
+        "initial_val_auc": initial_val_auc,
         "test_auc": test_auc,
         "oot_auc": oot_auc,
-        "num_features": len(views["feature_names"]),
-        "feature_names": views["feature_names"],
-        "feature_counts": views["feature_counts"],
-        "raw_column_scores": views["raw_column_scores"],
-        "engineered_feature_scores": views["engineered_feature_scores"],
-        "policy": policy_label,
+        "num_features": len(selected_names),
+        "feature_names": selected_names,
+        "feature_importance_gain": feature_importance,
+        "policy": policy,
         "description": description,
-        "config": config,
+        "config": {
+            "name": config["name"],
+            "feature_cap": config["feature_cap"],
+            "sampling": config["sampling"],
+            "scale_pos_weight": scale_pos_weight,
+            "hyperparams": config["hyperparams"],
+        },
+        "initial_best_iteration": int(initial_booster.best_iteration),
         "best_iteration": int(booster.best_iteration),
         "train_auc_history_tail": evals_result["train"]["auc"][-5:],
         "val_auc_history_tail": evals_result["val"]["auc"][-5:],
-        "class_balance": f"{pos_rate * 100.0:.2f}%/{(1.0 - pos_rate) * 100.0:.2f}%",
-        "split_source": dataset["split_source"],
-        "time_column": dataset["time_column"],
-        "effective_column_types": views["effective_column_types"],
-        "elapsed_seconds": time.time() - started,
+        "class_balance": sampled_class_balance,
+        "original_class_balance": original_class_balance,
+        "sampled_class_balance": sampled_class_balance,
     }
-    print(
-        f"trial={trial:02d} val_auc={val_auc:.6f} test_auc={test_auc:.6f} "
-        f"oot_auc={oot_auc:.6f} features={len(views['feature_names']):04d} "
-        f"policy={config['name']}"
-    )
+    return result, signature
+
+
+def run_baseline(cache_dir: Path | None = None) -> dict:
+    data = load_arrays(cache_dir=cache_dir)
+    original_class_balance = class_balance_string(data["y_train"])
+    config = {
+        "name": "baseline",
+        "feature_cap": None,
+        "sampling": BASELINE_SAMPLING,
+        "hyperparams": BASELINE_PARAMS,
+    }
+    result, _ = run_trial(data=data, trial=1, config=config, original_class_balance=original_class_balance)
+    result["elapsed_seconds"] = 0.0
+    print_trial(result)
     return result
 
 
-def maybe_save_overall_best_dataset(
-    dataset: dict,
-    best_result: dict,
-    output_path: Path,
-) -> bool:
-    metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
-    existing_val_auc = float("-inf")
-    if metadata_path.exists():
-        existing = json.loads(metadata_path.read_text())
-        existing_val_auc = float(existing.get("val_auc", float("-inf")))
-
-    current_val_auc = float(best_result["val_auc"])
-    if current_val_auc <= existing_val_auc:
-        return False
-
-    feature_policy = best_result["config"].get("feature_policy")
-    views = (
-        engineer_baseline_views(dataset=dataset)
-        if feature_policy is None
-        else engineer_feature_views(dataset=dataset, feature_policy=feature_policy)
-    )
-    engineered = pd.concat(
-        [
-            pd.DataFrame(views["x_train"], columns=views["feature_names"]).assign(
-                target=dataset["y_train"].astype(np.int64),
-                split="train",
-            ),
-            pd.DataFrame(views["x_val"], columns=views["feature_names"]).assign(
-                target=dataset["y_val"].astype(np.int64),
-                split="val",
-            ),
-            pd.DataFrame(views["x_test"], columns=views["feature_names"]).assign(
-                target=dataset["y_test"].astype(np.int64),
-                split="test",
-            ),
-            pd.DataFrame(views["x_oot"], columns=views["feature_names"]).assign(
-                target=dataset["y_oot"].astype(np.int64),
-                split="oot",
-            ),
-        ],
-        ignore_index=True,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    engineered.to_parquet(output_path, index=False)
-
-    metadata = {
-        "num_features": len(views["feature_names"]),
-        "feature_names": views["feature_names"],
-        "feature_counts": views["feature_counts"],
-        "split_source": dataset["split_source"],
-        "time_column": dataset["time_column"],
-    }
-    if feature_policy is None:
-        metadata["baseline"] = True
-    else:
-        metadata["feature_policy"] = feature_policy["name"]
-    metadata.update(
-        {
-            "val_auc": current_val_auc,
-            "test_auc": float(best_result["test_auc"]),
-            "oot_auc": float(best_result["oot_auc"]),
-            "policy": best_result["policy"],
-            "description": best_result["description"],
-            "class_balance": best_result["class_balance"],
-            "best_iteration": int(best_result["best_iteration"]),
-            "saved_from_trial": int(best_result["trial"]),
-        }
-    )
-    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
-    return True
-
-
-def run_baseline(cache_dir: Path) -> tuple[dict, dict]:
-    dataset = load_dataset(cache_dir=cache_dir)
-    return evaluate_run(dataset=dataset, trial=1), dataset
-
-
-def run_search(cache_dir: Path) -> tuple[dict, dict]:
-    dataset = load_dataset(cache_dir=cache_dir)
+def run_search(cache_dir: Path | None = None) -> dict:
+    data = load_arrays(cache_dir=cache_dir)
+    original_class_balance = class_balance_string(data["y_train"])
     start = time.time()
     best = None
+    evaluated = 0
+    seen_signatures = set()
 
-    for trial, feature_policy in enumerate(FEATURE_POLICIES, start=1):
-        if time.time() - start > max(TIME_BUDGET, 600.0):
+    for config in candidate_configs():
+        if evaluated >= MAX_TRIALS or time.time() - start > SEARCH_TIME_BUDGET:
             break
-        result = evaluate_run(dataset=dataset, trial=trial, feature_policy=feature_policy)
+
+        trial_number = evaluated + 1
+        result, signature = run_trial(
+            data=data,
+            trial=trial_number,
+            config=config,
+            original_class_balance=original_class_balance,
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        evaluated += 1
+        result["trial"] = evaluated
+        print_trial(result)
         if best is None or result["val_auc"] > best["val_auc"]:
             best = result
 
     assert best is not None
     best["elapsed_seconds"] = time.time() - start
-    return best, dataset
+    return best
 
 
 def main() -> None:
@@ -627,7 +427,7 @@ def main() -> None:
     parser.add_argument(
         "--baseline",
         action="store_true",
-        help="Run only the raw split-dataset baseline without applying FEATURE_POLICIES.",
+        help="Run the required untuned baseline instead of the current search policy.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -635,28 +435,9 @@ def main() -> None:
         default=LOCAL_CACHE_DIR,
         help="Location of the prepared dataset cache.",
     )
-    parser.add_argument(
-        "--save-overall-best-dataset",
-        type=Path,
-        default=DEFAULT_OVERALL_BEST_DATASET_PATH,
-        help="Parquet path for the best overall engineered dataset across runs; overwritten only when val_auc improves.",
-    )
     args = parser.parse_args()
 
-    best, dataset = (
-        run_baseline(cache_dir=args.cache_dir)
-        if args.baseline
-        else run_search(cache_dir=args.cache_dir)
-    )
-
-    if args.save_overall_best_dataset is not None:
-        updated = maybe_save_overall_best_dataset(
-            dataset=dataset,
-            best_result=best,
-            output_path=args.save_overall_best_dataset,
-        )
-        print(f"saved_overall_best_dataset: {args.save_overall_best_dataset} updated={int(updated)}")
-
+    best = run_baseline(cache_dir=args.cache_dir) if args.baseline else run_search(cache_dir=args.cache_dir)
     print(json.dumps(best, indent=2))
     print(f"val_auc: {best['val_auc']:.6f}")
 

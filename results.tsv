@@ -1,21 +1,11 @@
 commit	val_auc	initial_val_auc	test_auc	oot_auc	num_features	class_balance	status	description
-228791f	0.674828	0.674828	0.676463	0.601934	248	5.16%/94.84%	keep	baseline raw numeric and bool split-dataset features
-228791f	0.672786	0.672786	0.654595	0.568685	128	5.16%/94.84%	drop	add starting ratio and multiply pairs with a 128-feature cap
-228791f	0.661818	0.661818	0.655050	0.582698	64	5.16%/94.84%	drop	add starting ratio and multiply pairs with a 64-feature cap
-228791f	0.655232	0.655232	0.636341	0.584828	126	5.16%/94.84%	drop	screen to 64 numeric columns before adding starting ratio and multiply pairs
-228791f	0.655232	0.655232	0.636341	0.584828	126	5.16%/94.84%	drop	screen to 64 numeric columns before adding burden-style ratio and multiply pairs
-228791f	0.655232	0.655232	0.636341	0.584828	126	5.16%/94.84%	drop	screen to 64 numeric columns with missing flags and no pair features
-228791f	0.673039	0.673039	0.650640	0.601808	128	5.16%/94.84%	drop	add burden-style ratio and multiply pairs with a 128-feature cap
-228791f	0.661036	0.661036	0.643633	0.578441	64	5.16%/94.84%	drop	add burden-style ratio and multiply pairs with a 64-feature cap
-228791f	0.688911	0.688911	0.656316	0.590151	128	5.16%/94.84%	keep	add burden-style ratio and multiply pairs with a 128-feature cap and no missing flags
-228791f	0.676000	0.676000	0.657492	0.593829	128	5.16%/94.84%	drop	add both starting and burden-style pairs with a 128-feature cap and no missing flags
-228791f	0.683717	0.683717	0.667425	0.619749	192	5.16%/94.84%	drop	add burden-style ratio and multiply pairs with a 192-feature cap and no missing flags
-228791f	0.676344	0.676344	0.665438	0.606957	242	5.16%/94.84%	drop	add burden-style ratio and multiply pairs with no feature cap and no missing flags
-228791f	0.671760	0.671760	0.674193	0.593396	192	5.16%/94.84%	drop	add starting ratio and multiply pairs with a 192-feature cap and no missing flags
-228791f	0.694468	0.694468	0.655862	0.574718	241	5.16%/94.84%	keep	add starting ratio and multiply pairs with no feature cap and no missing flags
-228791f	0.674134	0.674134	0.664901	0.594337	192	5.16%/94.84%	drop	add burden-style ratio pairs only with a 192-feature cap and no missing flags
-228791f	0.676544	0.676544	0.671103	0.595120	224	5.16%/94.84%	drop	add burden-style ratio and multiply pairs with a 224-feature cap and no missing flags
-228791f	0.685417	0.685417	0.660908	0.606042	160	5.16%/94.84%	drop	add burden-style ratio and multiply pairs with a 160-feature cap and no missing flags
-228791f	0.703574	0.703574	0.649335	0.594749	467	5.16%/94.84%	keep	add starting ratio and multiply feature pairs with numeric missing flags
-228791f	0.672148	0.672148	0.662510	0.605719	192	5.16%/94.84%	drop	add burden-style pairs plus mortgage-share ratio with a 192-feature cap and no missing flags
-228791f	0.671856	0.671856	0.664514	0.601670	192	5.16%/94.84%	drop	add burden-style ratios plus utilization-severity multiply with a 192-feature cap and no missing flags
+ab402a2	0.697955	0.697955	0.691223	0.616090	249	5.16%/94.84%	keep	plain xgboost baseline without tuning or feature pruning
+ab402a2	0.711847	0.706567	0.684525	0.614798	132	5.16%/94.84%	keep	try none keep 132 features with depth 4 eta 0.085, min child weight 8.0
+ab402a2	0.721244	0.720122	0.685501	0.619540	136	14.00%/86.00%	keep	try undersample_14 keep 136 features with a shallow tree eta 0.10, min child weight 6.0
+ab402a2	0.723022	0.711394	0.688539	0.618716	136	5.16%/94.84%	keep	try none keep 136 features with a shallow tree eta 0.095, min child weight 7.0
+ab402a2	0.723022	0.711394	0.688539	0.618716	136	5.16%/94.84%	discard	restricted no-sampling refinement matched the current best without improvement
+ab402a2	0.719543	0.709013	0.683663	0.630832	136	5.16%/94.84%	discard	try none keep 136 features with a shallow tree eta 0.095, min child weight 7.0
+ab402a2	0.723036	0.711394	0.688539	0.618716	136	5.16%/94.84%	keep	feature-cap-only sweep confirmed 136 as the best retained feature count in the incumbent setup
+ab402a2	0.723022	0.711394	0.688539	0.618716	136	5.16%/94.84%	discard	broader sampling reopen returned to the current no-sampling winner without improvement
+ab402a2	0.723022	0.711394	0.688539	0.618716	136	5.16%/94.84%	discard	eta and boosting-round refinement returned to the current no-sampling winner without improvement
+ab402a2	0.723022	0.711394	0.688539	0.618716	136	5.16%/94.84%	discard	no-sampling weight sweep returned to the current winner without improvement
