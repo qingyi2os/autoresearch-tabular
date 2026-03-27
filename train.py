@@ -1,630 +1,665 @@
-"""
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
-"""
-
-import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
-import gc
-import math
+import argparse
+import json
 import time
-from dataclasses import dataclass, asdict
+from collections.abc import Callable
+from pathlib import Path
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import xgboost as xgb
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+from prepare import TIME_BUDGET, auc_score, load_dataset
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+RANDOM_SEED = 1337
+EARLY_STOPPING_ROUNDS = 30
+LOCAL_CACHE_DIR = Path(".cache") / "autoresearch-tabular"
+DEFAULT_OVERALL_BEST_DATASET_PATH = LOCAL_CACHE_DIR / "best_overall_engineered_dataset.parquet.gzip"
 
-# ---------------------------------------------------------------------------
-# GPT Model
-# ---------------------------------------------------------------------------
+FIXED_XGB_PARAMS = {
+    "eta": 0.3,
+    "max_depth": 6,
+    "min_child_weight": 1.0,
+    "subsample": 1.0,
+    "colsample_bytree": 1.0,
+    "gamma": 0.0,
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.0,
+    "scale_pos_weight": 1.0,
+    "n_estimators": 100,
+}
 
-@dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
+FEATURE_POLICY_BASE = {
+    "screen_k": None,
+    "feature_cap": None,
+    "include_raw_numeric": True,
+    "ratio_pairs": (),
+    "multiply_pairs": (),
+    "add_numeric_missing_flags": True,
+}
 
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
-
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-
-    def forward(self, x, ve, cos_sin, window_size):
-        B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
-
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
-
-
-class GPT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
-        })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
-        # Rotary embeddings
-        self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
-    @torch.no_grad()
-    def init_weights(self):
-        # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
-
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.transformer.wte.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
-
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
-    def estimate_flops(self):
-        """Estimated FLOPs per token (forward + backward)."""
-        nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        t = self.config.sequence_len
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        return 6 * (nparams - nparams_exclude) + attn_flops
-
-    def num_scaling_params(self):
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
-        }
-
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
-        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
-        optimizer = MuonAdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
-
-    def forward(self, idx, targets=None, reduction='mean'):
-        B, T = idx.size()
-        assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
-
-        x = self.transformer.wte(idx)
-        x = norm(x)
-        x0 = x
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
-
-        softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
-
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
-        return logits
-
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
-# ---------------------------------------------------------------------------
-
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
-
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
-
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
-    # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
-
-
-class MuonAdamW(torch.optim.Optimizer):
-    """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
-
-    def __init__(self, param_groups):
-        super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-
-    def _step_adamw(self, group):
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad
-            state = self.state[p]
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
-
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
-            return
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            if group['kind'] == 'adamw':
-                self._step_adamw(group)
-            elif group['kind'] == 'muon':
-                self._step_muon(group)
-
-# ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
-# ---------------------------------------------------------------------------
-
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-
-# Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
-
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
-
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
-
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
-
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
-    )
-
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
-
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
-
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
+STARTING_RATIO_PAIRS = (
+    ("tot_mthly_obligation_accts_3m", "tot_pymt_amount_accts_3m"),
+    ("tot_bal_bc_accts_3m", "tot_pymt_amount_bc_accts_3m"),
+    ("tot_mthly_obligation_bc_accts_3m", "tot_pymt_amount_bc_accts_3m"),
+    ("tot_bal_bc_accts_3m", "tot_mthly_obligation_bc_accts_3m"),
+    ("tot_sched_mthly_pymt_open_mtg_trds_12m", "tot_sched_mthly_pymt_all_trds_12m"),
 )
 
-model = torch.compile(model, dynamic=False)
+STARTING_MULTIPLY_PAIRS = (
+    ("num_open_sat_inst_trds_24m_plus", "tot_sched_mthly_pymt_open_inst_trds_12m"),
+)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+BURDEN_RATIO_PAIRS = (
+    ("monthly_debt", "stated_monthly_income"),
+    ("tot_sched_mthly_pymt_all_trds_12m", "stated_monthly_income"),
+    ("tot_sched_mthly_pymt_open_mtg_trds_12m", "stated_monthly_income"),
+    ("tot_sched_mthly_pymt_open_inst_trds_12m", "stated_monthly_income"),
+    ("revolving_balance", "stated_monthly_income"),
+)
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+BURDEN_MULTIPLY_PAIRS = (
+    ("util_open_cc_trds_12m", "avg_bal_all_cc_trds_0_12m"),
+    ("num_deduped_inq_12m", "monthly_debt"),
+)
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+HYBRID_RATIO_PAIRS = BURDEN_RATIO_PAIRS + (
+    ("tot_sched_mthly_pymt_open_mtg_trds_12m", "tot_sched_mthly_pymt_all_trds_12m"),
+)
 
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
+HYBRID_MULTIPLY_PAIRS = (
+    ("util_open_cc_trds_12m", "avg_bal_all_cc_trds_0_12m"),
+)
+
+
+FEATURE_POLICIES = [
+    {
+        **FEATURE_POLICY_BASE,
+        "name": "starting_mtg_share_plus_inst_scale_mul",
+        "ratio_pairs": STARTING_RATIO_PAIRS,
+        "multiply_pairs": STARTING_MULTIPLY_PAIRS,
+    },
+    {
+        **FEATURE_POLICY_BASE,
+        "name": "burden_pairs_cap192_nomiss",
+        "ratio_pairs": BURDEN_RATIO_PAIRS,
+        "multiply_pairs": BURDEN_MULTIPLY_PAIRS,
+        "feature_cap": 192,
+        "add_numeric_missing_flags": False,
+    },
+]
+
+BASELINE_NAME = "split_dataset_raw"
+
+
+# Helpers
+
+def safe_corr(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return 0.0
+    x = x[mask]
+    y = y[mask]
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = np.sqrt((x @ x) * (y @ y))
+    if denom <= 1e-12:
+        return 0.0
+    return float(abs((x @ y) / denom))
+
+
+# Feature matrix helpers
+
+def append_feature(
+    parts: list[list[np.ndarray]],
+    arrays: list[np.ndarray],
+    feature_names: list[str],
+    name: str,
+) -> None:
+    for frame_parts, array in zip(parts, arrays, strict=True):
+        frame_parts.append(array.astype(np.float64, copy=False))
+    feature_names.append(name)
+
+
+def score_numeric_column(series: pd.Series, y_train: np.ndarray) -> float:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+    missing = np.isnan(values)
+    score = 0.0
+    if np.any(missing):
+        score = max(score, safe_corr(missing.astype(np.float64), y_train))
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return score
+    median = float(np.nanmedian(values[finite]))
+    filled = np.where(missing, median, values)
+    return max(score, safe_corr(filled, y_train))
+
+
+def apply_feature_cap(
+    matrices: list[np.ndarray],
+    y_train: np.ndarray,
+    feature_names: list[str],
+    feature_cap: int | None,
+) -> tuple[list[np.ndarray], list[str], list[float]]:
+    num_features = matrices[0].shape[1]
+    scores = [safe_corr(matrices[0][:, idx], y_train) for idx in range(num_features)]
+    if feature_cap is None or feature_cap <= 0 or num_features <= feature_cap:
+        return matrices, feature_names, scores
+
+    ranked_idx = sorted(range(num_features), key=lambda idx: (-scores[idx], feature_names[idx]))
+    selected_idx = ranked_idx[:feature_cap]
+    selected_idx.sort()
+    capped_matrices = [matrix[:, selected_idx] for matrix in matrices]
+    capped_names = [feature_names[idx] for idx in selected_idx]
+    capped_scores = [scores[idx] for idx in selected_idx]
+    return capped_matrices, capped_names, capped_scores
+
+
+def build_numeric_features(
+    train_frame: pd.DataFrame,
+    other_frames: list[pd.DataFrame],
+    columns: list[str],
+    feature_policy: dict,
+    excluded_raw_columns: set[str],
+    parts: list[list[np.ndarray]],
+    feature_names: list[str],
+) -> None:
+    all_frames = [train_frame, *other_frames]
+    for column in columns:
+        series_list = [pd.to_numeric(frame[column], errors="coerce") for frame in all_frames]
+        train_values = series_list[0].to_numpy(dtype=np.float64, na_value=np.nan)
+        exclude_raw_column = column in excluded_raw_columns
+
+        if feature_policy["add_numeric_missing_flags"] and not exclude_raw_column:
+            missing_flags = [series.isna().to_numpy(dtype=np.float64) for series in series_list]
+            if np.any(missing_flags[0]):
+                append_feature(
+                    parts,
+                    missing_flags,
+                    feature_names,
+                    f"{column}__missing",
+                )
+
+        finite_train = train_values[np.isfinite(train_values)]
+        fill_value = float(np.nanmedian(finite_train)) if len(finite_train) else 0.0
+        arrays = [series.fillna(fill_value).to_numpy(dtype=np.float64) for series in series_list]
+        if feature_policy["include_raw_numeric"] and not exclude_raw_column:
+            append_feature(
+                parts,
+                arrays,
+                feature_names,
+                column,
+            )
+
+
+def numeric_combo_arrays(
+    train_frame: pd.DataFrame,
+    other_frames: list[pd.DataFrame],
+    left_column: str,
+    right_column: str,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    all_frames = [train_frame, *other_frames]
+    left_series_list = [pd.to_numeric(frame[left_column], errors="coerce") for frame in all_frames]
+    right_series_list = [pd.to_numeric(frame[right_column], errors="coerce") for frame in all_frames]
+
+    left_train = left_series_list[0].to_numpy(dtype=np.float64, na_value=np.nan)
+    right_train = right_series_list[0].to_numpy(dtype=np.float64, na_value=np.nan)
+    left_fill = float(np.nanmedian(left_train[np.isfinite(left_train)])) if np.isfinite(left_train).any() else 0.0
+    right_fill = float(np.nanmedian(right_train[np.isfinite(right_train)])) if np.isfinite(right_train).any() else 0.0
+
+    left_arrays = [series.fillna(left_fill).to_numpy(dtype=np.float64) for series in left_series_list]
+    right_arrays = [series.fillna(right_fill).to_numpy(dtype=np.float64) for series in right_series_list]
+    return left_arrays, right_arrays
+
+
+def divide_feature_arrays(
+    numerator_arrays: list[np.ndarray],
+    denominator_arrays: list[np.ndarray],
+    eps: float = 1e-6,
+) -> list[np.ndarray]:
+    outputs: list[np.ndarray] = []
+    for numerator, denominator in zip(numerator_arrays, denominator_arrays, strict=True):
+        safe_denominator = np.where(np.abs(denominator) < eps, np.nan, denominator)
+        divided = np.divide(
+            numerator,
+            safe_denominator,
+            out=np.zeros_like(numerator, dtype=np.float64),
+            where=np.isfinite(safe_denominator),
+        )
+        outputs.append(np.nan_to_num(divided, nan=0.0, posinf=0.0, neginf=0.0))
+    return outputs
+
+
+# Model helpers
+
+def fit_xgboost(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+) -> tuple[xgb.Booster, dict]:
+    train_dmatrix = xgb.DMatrix(x_train, label=y_train)
+    val_dmatrix = xgb.DMatrix(x_val, label=y_val)
+    train_params = dict(FIXED_XGB_PARAMS)
+    num_boost_round = int(train_params.pop("n_estimators"))
+
+    evals_result: dict = {}
+    booster = xgb.train(
+        params={
+            "objective": "binary:logistic",
+            "eval_metric": "auc",
+            "tree_method": "hist",
+            "seed": RANDOM_SEED,
+            "max_delta_step": 1.0,
+            **train_params,
+        },
+        dtrain=train_dmatrix,
+        num_boost_round=num_boost_round,
+        evals=[(train_dmatrix, "train"), (val_dmatrix, "val")],
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        verbose_eval=False,
+        evals_result=evals_result,
+    )
+    return booster, evals_result
+
+
+def predict_scores(booster: xgb.Booster, x: np.ndarray) -> np.ndarray:
+    dmatrix = xgb.DMatrix(x)
+    best_iteration = getattr(booster, "best_iteration", None)
+    if best_iteration is None:
+        return booster.predict(dmatrix)
+    return booster.predict(dmatrix, iteration_range=(0, best_iteration + 1))
+
+
+# Feature engineering
+
+
+def build_pair_features(
+    train_frame: pd.DataFrame,
+    other_frames: list[pd.DataFrame],
+    variable_combinations: list[tuple[str, str]],
+    parts: list[list[np.ndarray]],
+    feature_names: list[str],
+    suffix: str,
+    combine_arrays: Callable[[list[np.ndarray], list[np.ndarray]], list[np.ndarray]],
+) -> None:
+    for left_column, right_column in variable_combinations:
+        left_arrays, right_arrays = numeric_combo_arrays(
+            train_frame=train_frame,
+            other_frames=other_frames,
+            left_column=left_column,
+            right_column=right_column,
+        )
+        pair_arrays = combine_arrays(left_arrays, right_arrays)
+        append_feature(
+            parts,
+            pair_arrays,
+            feature_names,
+            f"{left_column}__{suffix}__{right_column}",
+        )
+
+
+def engineer_feature_views(dataset: dict, feature_policy: dict) -> dict:
+    train_frame = dataset["frame_train"]
+    other_frames = [dataset["frame_val"], dataset["frame_test"], dataset["frame_oot"]]
+    frames = [train_frame, *other_frames]
+    numeric_columns = list(dataset["column_types"]["numeric"])
+    raw_scores = {
+        column: score_numeric_column(train_frame[column], dataset["y_train"])
+        for column in numeric_columns
+    }
+    screen_k = feature_policy["screen_k"]
+    if screen_k is not None and screen_k > 0 and screen_k < len(numeric_columns):
+        ranked = sorted(raw_scores.items(), key=lambda item: (-item[1], item[0]))
+        numeric_columns = [column for column, _ in ranked[:screen_k]]
+
+    numeric_column_set = set(numeric_columns)
+    ratio_pairs = [
+        (left_column, right_column)
+        for left_column, right_column in feature_policy["ratio_pairs"]
+        if left_column in numeric_column_set and right_column in numeric_column_set
+    ]
+    multiply_pairs = [
+        (left_column, right_column)
+        for left_column, right_column in feature_policy["multiply_pairs"]
+        if left_column in numeric_column_set and right_column in numeric_column_set
+    ]
+    paired_columns = {
+        column
+        for left_column, right_column in [*ratio_pairs, *multiply_pairs]
+        for column in (left_column, right_column)
+    }
+
+    parts: list[list[np.ndarray]] = [[] for _ in frames]
+    feature_names: list[str] = []
+
+    build_numeric_features(
+        train_frame=train_frame,
+        other_frames=other_frames,
+        columns=numeric_columns,
+        feature_policy=feature_policy,
+        excluded_raw_columns=paired_columns,
+        parts=parts,
+        feature_names=feature_names,
+    )
+
+    build_pair_features(
+        train_frame=train_frame,
+        other_frames=other_frames,
+        variable_combinations=ratio_pairs,
+        parts=parts,
+        feature_names=feature_names,
+        suffix="ratio",
+        combine_arrays=divide_feature_arrays,
+    )
+    build_pair_features(
+        train_frame=train_frame,
+        other_frames=other_frames,
+        variable_combinations=multiply_pairs,
+        parts=parts,
+        feature_names=feature_names,
+        suffix="mul",
+        combine_arrays=lambda left_arrays, right_arrays: [
+            (left * right).astype(np.float64, copy=False)
+            for left, right in zip(left_arrays, right_arrays, strict=True)
+        ],
+    )
+
+    matrices = []
+    for frame, frame_parts in zip(frames, parts, strict=True):
+        if frame_parts:
+            matrices.append(np.column_stack(frame_parts).astype(np.float64, copy=False))
+        else:
+            matrices.append(np.empty((len(frame), 0), dtype=np.float64))
+
+    matrices, feature_names, engineered_scores = apply_feature_cap(
+        matrices=matrices,
+        y_train=dataset["y_train"],
+        feature_names=feature_names,
+        feature_cap=feature_policy["feature_cap"],
+    )
+
+    return {
+        "x_train": matrices[0],
+        "x_val": matrices[1],
+        "x_test": matrices[2],
+        "x_oot": matrices[3],
+        "feature_names": feature_names,
+        "feature_counts": {
+            "numeric": len(feature_names),
+            "bool": 0,
+            "categorical": 0,
+            "datetime": 0,
+        },
+        "effective_column_types": {
+            "numeric": list(numeric_columns),
+            "bool": [],
+            "categorical": [],
+            "datetime": [],
+        },
+        "raw_column_scores": raw_scores,
+        "engineered_feature_scores": engineered_scores,
+    }
+
+
+def engineer_baseline_views(dataset: dict) -> dict:
+    numeric_columns = list(dataset["column_types"]["numeric"])
+    bool_columns = list(dataset["column_types"]["bool"])
+    feature_names = [*numeric_columns, *bool_columns]
+    matrices = [
+        np.column_stack(
+            [
+                pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+                for column in feature_names
+            ]
+        ).astype(np.float64, copy=False)
+        for frame in [
+            dataset["frame_train"],
+            dataset["frame_val"],
+            dataset["frame_test"],
+            dataset["frame_oot"],
+        ]
+    ]
+
+    return {
+        "x_train": matrices[0],
+        "x_val": matrices[1],
+        "x_test": matrices[2],
+        "x_oot": matrices[3],
+        "feature_names": feature_names,
+        "feature_counts": {
+            "numeric": len(numeric_columns),
+            "bool": len(bool_columns),
+            "categorical": 0,
+            "datetime": 0,
+        },
+        "effective_column_types": {
+            "numeric": numeric_columns,
+            "bool": bool_columns,
+            "categorical": [],
+            "datetime": [],
+        },
+        "raw_column_scores": {},
+        "engineered_feature_scores": [
+            safe_corr(matrices[0][:, idx], dataset["y_train"])
+            for idx in range(matrices[0].shape[1])
+        ],
+    }
+
+
+# Evaluation
+
+def describe_feature_policy(feature_policy: dict) -> str:
+    return (
+        f"fe={feature_policy['name']} "
+        f"screen_k={feature_policy['screen_k']} "
+        f"feature_cap={feature_policy['feature_cap']} "
+        f"raw_numeric={int(feature_policy['include_raw_numeric'])} "
+        f"ratio_pairs={len(feature_policy['ratio_pairs'])} "
+        f"multiply_pairs={len(feature_policy['multiply_pairs'])} "
+        f"missing_flags=num:{int(feature_policy['add_numeric_missing_flags'])}"
+    )
+
+
+def evaluate_run(dataset: dict, trial: int, feature_policy: dict | None = None) -> dict:
+    started = time.time()
+    if feature_policy is None:
+        views = engineer_baseline_views(dataset=dataset)
+        policy_label = "baseline=split_dataset_raw numeric+bool_only no_feature_policy"
+        description = "single fixed xgboost on split dataset raw numeric and bool columns only"
+        config = {
+            "name": BASELINE_NAME,
+            "baseline": True,
+            "xgboost_params": FIXED_XGB_PARAMS,
+        }
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        views = engineer_feature_views(dataset=dataset, feature_policy=feature_policy)
+        policy_label = describe_feature_policy(feature_policy)
+        description = f"single fixed xgboost with {feature_policy['name']} feature engineering"
+        config = {
+            "name": feature_policy["name"],
+            "feature_policy": feature_policy,
+            "xgboost_params": FIXED_XGB_PARAMS,
+        }
 
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    booster, evals_result = fit_xgboost(
+        x_train=views["x_train"],
+        y_train=dataset["y_train"],
+        x_val=views["x_val"],
+        y_val=dataset["y_val"],
+    )
+    val_scores = predict_scores(booster, views["x_val"])
+    test_scores = predict_scores(booster, views["x_test"])
+    oot_scores = predict_scores(booster, views["x_oot"])
+    val_auc = auc_score(dataset["y_val"], val_scores)
+    test_auc = auc_score(dataset["y_test"], test_scores)
+    oot_auc = auc_score(dataset["y_oot"], oot_scores)
+    pos_rate = float(np.mean(dataset["y_train"]))
 
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    result = {
+        "trial": trial,
+        "val_auc": val_auc,
+        "initial_val_auc": val_auc,
+        "test_auc": test_auc,
+        "oot_auc": oot_auc,
+        "num_features": len(views["feature_names"]),
+        "feature_names": views["feature_names"],
+        "feature_counts": views["feature_counts"],
+        "raw_column_scores": views["raw_column_scores"],
+        "engineered_feature_scores": views["engineered_feature_scores"],
+        "policy": policy_label,
+        "description": description,
+        "config": config,
+        "best_iteration": int(booster.best_iteration),
+        "train_auc_history_tail": evals_result["train"]["auc"][-5:],
+        "val_auc_history_tail": evals_result["val"]["auc"][-5:],
+        "class_balance": f"{pos_rate * 100.0:.2f}%/{(1.0 - pos_rate) * 100.0:.2f}%",
+        "split_source": dataset["split_source"],
+        "time_column": dataset["time_column"],
+        "effective_column_types": views["effective_column_types"],
+        "elapsed_seconds": time.time() - started,
+    }
+    print(
+        f"trial={trial:02d} val_auc={val_auc:.6f} test_auc={test_auc:.6f} "
+        f"oot_auc={oot_auc:.6f} features={len(views['feature_names']):04d} "
+        f"policy={config['name']}"
+    )
+    return result
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+def maybe_save_overall_best_dataset(
+    dataset: dict,
+    best_result: dict,
+    output_path: Path,
+) -> bool:
+    metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
+    existing_val_auc = float("-inf")
+    if metadata_path.exists():
+        existing = json.loads(metadata_path.read_text())
+        existing_val_auc = float(existing.get("val_auc", float("-inf")))
 
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next(train_loader)
+    current_val_auc = float(best_result["val_auc"])
+    if current_val_auc <= existing_val_auc:
+        return False
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+    feature_policy = best_result["config"].get("feature_policy")
+    views = (
+        engineer_baseline_views(dataset=dataset)
+        if feature_policy is None
+        else engineer_feature_views(dataset=dataset, feature_policy=feature_policy)
+    )
+    engineered = pd.concat(
+        [
+            pd.DataFrame(views["x_train"], columns=views["feature_names"]).assign(
+                target=dataset["y_train"].astype(np.int64),
+                split="train",
+            ),
+            pd.DataFrame(views["x_val"], columns=views["feature_names"]).assign(
+                target=dataset["y_val"].astype(np.int64),
+                split="val",
+            ),
+            pd.DataFrame(views["x_test"], columns=views["feature_names"]).assign(
+                target=dataset["y_test"].astype(np.int64),
+                split="test",
+            ),
+            pd.DataFrame(views["x_oot"], columns=views["feature_names"]).assign(
+                target=dataset["y_oot"].astype(np.int64),
+                split="oot",
+            ),
+        ],
+        ignore_index=True,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    engineered.to_parquet(output_path, index=False)
 
-    train_loss_f = train_loss.item()
+    metadata = {
+        "num_features": len(views["feature_names"]),
+        "feature_names": views["feature_names"],
+        "feature_counts": views["feature_counts"],
+        "split_source": dataset["split_source"],
+        "time_column": dataset["time_column"],
+    }
+    if feature_policy is None:
+        metadata["baseline"] = True
+    else:
+        metadata["feature_policy"] = feature_policy["name"]
+    metadata.update(
+        {
+            "val_auc": current_val_auc,
+            "test_auc": float(best_result["test_auc"]),
+            "oot_auc": float(best_result["oot_auc"]),
+            "policy": best_result["policy"],
+            "description": best_result["description"],
+            "class_balance": best_result["class_balance"],
+            "best_iteration": int(best_result["best_iteration"]),
+            "saved_from_trial": int(best_result["trial"]),
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    return True
 
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+def run_baseline(cache_dir: Path) -> tuple[dict, dict]:
+    dataset = load_dataset(cache_dir=cache_dir)
+    return evaluate_run(dataset=dataset, trial=1), dataset
 
-    if step > 10:
-        total_training_time += dt
 
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+def run_search(cache_dir: Path) -> tuple[dict, dict]:
+    dataset = load_dataset(cache_dir=cache_dir)
+    start = time.time()
+    best = None
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    for trial, feature_policy in enumerate(FEATURE_POLICIES, start=1):
+        if time.time() - start > max(TIME_BUDGET, 600.0):
+            break
+        result = evaluate_run(dataset=dataset, trial=trial, feature_policy=feature_policy)
+        if best is None or result["val_auc"] > best["val_auc"]:
+            best = result
 
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
+    assert best is not None
+    best["elapsed_seconds"] = time.time() - start
+    return best, dataset
 
-    step += 1
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Run only the raw split-dataset baseline without applying FEATURE_POLICIES.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=LOCAL_CACHE_DIR,
+        help="Location of the prepared dataset cache.",
+    )
+    parser.add_argument(
+        "--save-overall-best-dataset",
+        type=Path,
+        default=DEFAULT_OVERALL_BEST_DATASET_PATH,
+        help="Parquet path for the best overall engineered dataset across runs; overwritten only when val_auc improves.",
+    )
+    args = parser.parse_args()
 
-print()  # newline after \r training log
+    best, dataset = (
+        run_baseline(cache_dir=args.cache_dir)
+        if args.baseline
+        else run_search(cache_dir=args.cache_dir)
+    )
 
-total_tokens = step * TOTAL_BATCH_SIZE
+    if args.save_overall_best_dataset is not None:
+        updated = maybe_save_overall_best_dataset(
+            dataset=dataset,
+            best_result=best,
+            output_path=args.save_overall_best_dataset,
+        )
+        print(f"saved_overall_best_dataset: {args.save_overall_best_dataset} updated={int(updated)}")
 
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    print(json.dumps(best, indent=2))
+    print(f"val_auc: {best['val_auc']:.6f}")
 
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+if __name__ == "__main__":
+    main()
