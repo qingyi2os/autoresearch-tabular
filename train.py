@@ -5,17 +5,16 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import xgboost as xgb
 
-from prepare import TIME_BUDGET, auc_score, load_dataset
+from prepare import TIME_BUDGET, auc_score, default_cache_dir, load_dataset
 
 RANDOM_SEED = 1337
 MAX_TRIALS = 120
 SEARCH_TIME_BUDGET = max(TIME_BUDGET, 600.0)
 NUM_BOOST_ROUND = 400
 EARLY_STOPPING_ROUNDS = 30
-LOCAL_CACHE_DIR = Path(".cache") / "autoresearch-tabular"
+LOCAL_CACHE_DIR = default_cache_dir()
 
 BASELINE_PARAMS = {
     "eta": 0.10,
@@ -43,40 +42,11 @@ HYPERPARAM_GRID = [
 ]
 SAMPLING_PLANS = [
     {"name": "none", "target_pos_rate": None, "scale_pos_weight_mode": "none"},
+    {"name": "undersample_14", "target_pos_rate": 0.14, "scale_pos_weight_mode": "none"},
+    {"name": "oversample_14", "target_pos_rate": 0.14, "scale_pos_weight_mode": "none"},
 ]
 
 BASELINE_SAMPLING = {"name": "none", "target_pos_rate": None, "scale_pos_weight_mode": "none"}
-NAT_SENTINEL = np.iinfo("int64").min
-
-
-# Data helpers
-
-def frame_to_matrix(frame: pd.DataFrame) -> np.ndarray:
-    arrays = []
-    for _, series in frame.items():
-        if np.issubdtype(series.dtype, np.datetime64):
-            ints = series.astype("int64", copy=False).to_numpy()
-            values = ints.astype(np.float64, copy=False)
-            values[ints == NAT_SENTINEL] = np.nan
-        else:
-            values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
-        arrays.append(values)
-    return np.column_stack(arrays).astype(np.float64, copy=False)
-
-
-def load_arrays(cache_dir: Path | None = None) -> dict:
-    dataset = load_dataset(cache_dir=cache_dir)
-    return {
-        "x_train": frame_to_matrix(dataset["frame_train"]),
-        "y_train": dataset["y_train"],
-        "x_val": frame_to_matrix(dataset["frame_val"]),
-        "y_val": dataset["y_val"],
-        "x_test": frame_to_matrix(dataset["frame_test"]),
-        "y_test": dataset["y_test"],
-        "x_oot": frame_to_matrix(dataset["frame_oot"]),
-        "y_oot": dataset["y_oot"],
-        "feature_names": dataset["feature_names"],
-    }
 
 
 # Sampling helpers
@@ -96,8 +66,6 @@ def resample_training_data(
 ) -> tuple[np.ndarray, np.ndarray]:
     if method == "none" or target_pos_rate is None:
         return x_train, y_train
-    if not method.startswith("undersample"):
-        raise ValueError(f"Unknown sampling method: {method}")
 
     rng = np.random.default_rng(seed)
     pos_idx = np.flatnonzero(y_train == 1)
@@ -105,11 +73,19 @@ def resample_training_data(
     if len(pos_idx) == 0 or len(neg_idx) == 0:
         return x_train, y_train
 
-    target_neg = int(round(len(pos_idx) * (1.0 - target_pos_rate) / target_pos_rate))
-    target_neg = min(len(neg_idx), max(target_neg, len(pos_idx)))
-    chosen_neg = rng.choice(neg_idx, size=target_neg, replace=False)
-    chosen = rng.permutation(np.concatenate([pos_idx, chosen_neg]))
-    return x_train[chosen], y_train[chosen]
+    if method.startswith("undersample"):
+        target_neg = int(round(len(pos_idx) * (1.0 - target_pos_rate) / target_pos_rate))
+        target_neg = min(len(neg_idx), max(target_neg, len(pos_idx)))
+        chosen_neg = rng.choice(neg_idx, size=target_neg, replace=False)
+        chosen = rng.permutation(np.concatenate([pos_idx, chosen_neg]))
+        return x_train[chosen], y_train[chosen]
+    if method.startswith("oversample"):
+        target_pos = int(round(len(neg_idx) * target_pos_rate / (1.0 - target_pos_rate)))
+        target_pos = max(target_pos, len(pos_idx))
+        extra_pos = rng.choice(pos_idx, size=target_pos - len(pos_idx), replace=True)
+        chosen = rng.permutation(np.concatenate([neg_idx, pos_idx, extra_pos]))
+        return x_train[chosen], y_train[chosen]
+    raise ValueError(f"Unknown sampling method: {method}")
 
 
 def effective_scale_pos_weight(mode: str, y_train: np.ndarray) -> float:
@@ -210,24 +186,15 @@ def candidate_configs() -> list[dict]:
         for hyperparams in HYPERPARAM_GRID
     ]
 
-
-def class_balance_string(y: np.ndarray) -> str:
-    pos_rate = float(np.mean(y))
-    return f"{pos_rate * 100.0:.2f}%/{(1.0 - pos_rate) * 100.0:.2f}%"
-
-
-def describe_feature_cap(feature_cap: int | None) -> str:
-    return "all" if feature_cap is None else str(feature_cap)
-
-
 def describe_policy(config: dict, num_features: int, scale_pos_weight: float) -> str:
     hyperparams = config["hyperparams"]
     sampling = config["sampling"]
     target_pos_rate = sampling["target_pos_rate"]
     target_pos_rate_str = "none" if target_pos_rate is None else f"{target_pos_rate:.2f}"
+    feature_cap = "all" if config["feature_cap"] is None else str(config["feature_cap"])
     return (
         f"name={config['name']} "
-        f"feature_cap={describe_feature_cap(config['feature_cap'])} "
+        f"feature_cap={feature_cap} "
         f"num_features={num_features} "
         f"sampling={sampling['name']} "
         f"target_pos_rate={target_pos_rate_str} "
@@ -258,26 +225,17 @@ def summarize_policy(config: dict, num_features: int) -> str:
 def print_trial(result: dict) -> None:
     hyperparams = result["config"]["hyperparams"]
     sampling = result["config"]["sampling"]
+    feature_cap = "all" if result["config"]["feature_cap"] is None else str(result["config"]["feature_cap"])
     print(
         f"trial={result['trial']:02d} val_auc={result['val_auc']:.6f} "
         f"initial_val_auc={result['initial_val_auc']:.6f} "
         f"test_auc={result['test_auc']:.6f} oot_auc={result['oot_auc']:.6f} "
         f"features={result['num_features']:03d} "
-        f"cap={describe_feature_cap(result['config']['feature_cap'])} "
+        f"cap={feature_cap} "
         f"sampling={sampling['name']} weight={sampling['scale_pos_weight_mode']} "
         f"depth={hyperparams['max_depth']} eta={hyperparams['eta']:.3f} "
         f"mcw={hyperparams['min_child_weight']:.1f}"
     )
-
-
-def trial_signature(config: dict, selected_idx: list[int]) -> tuple:
-    return (
-        tuple(selected_idx),
-        config["sampling"]["name"],
-        config["sampling"]["scale_pos_weight_mode"],
-        tuple(sorted(config["hyperparams"].items())),
-    )
-
 
 # Execution
 
@@ -312,7 +270,12 @@ def run_trial(
         num_features=data["x_train"].shape[1],
         feature_cap=config["feature_cap"],
     )
-    signature = trial_signature(config, selected_idx)
+    signature = (
+        tuple(selected_idx),
+        config["sampling"]["name"],
+        config["sampling"]["scale_pos_weight_mode"],
+        tuple(sorted(config["hyperparams"].items())),
+    )
 
     selected_names = [data["feature_names"][idx] for idx in selected_idx]
     train_view = data["x_train"][:, selected_idx]
@@ -343,7 +306,8 @@ def run_trial(
         if is_baseline
         else summarize_policy(config, len(selected_names))
     )
-    sampled_class_balance = class_balance_string(sampled_y)
+    pos_rate = float(np.mean(sampled_y))
+    sampled_class_balance = f"{pos_rate * 100.0:.2f}%/{(1.0 - pos_rate) * 100.0:.2f}%"
 
     result = {
         "trial": trial,
@@ -374,9 +338,9 @@ def run_trial(
     return result, signature
 
 
-def run_baseline(cache_dir: Path | None = None) -> dict:
-    data = load_arrays(cache_dir=cache_dir)
-    original_class_balance = class_balance_string(data["y_train"])
+def run_baseline(data: dict) -> dict:
+    pos_rate = float(np.mean(data["y_train"]))
+    original_class_balance = f"{pos_rate * 100.0:.2f}%/{(1.0 - pos_rate) * 100.0:.2f}%"
     config = {
         "name": "baseline",
         "feature_cap": None,
@@ -389,9 +353,9 @@ def run_baseline(cache_dir: Path | None = None) -> dict:
     return result
 
 
-def run_search(cache_dir: Path | None = None) -> dict:
-    data = load_arrays(cache_dir=cache_dir)
-    original_class_balance = class_balance_string(data["y_train"])
+def run_search(data: dict) -> dict:
+    pos_rate = float(np.mean(data["y_train"]))
+    original_class_balance = f"{pos_rate * 100.0:.2f}%/{(1.0 - pos_rate) * 100.0:.2f}%"
     start = time.time()
     best = None
     evaluated = 0
@@ -437,7 +401,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    best = run_baseline(cache_dir=args.cache_dir) if args.baseline else run_search(cache_dir=args.cache_dir)
+    dataset = load_dataset(cache_dir=args.cache_dir)
+    data = {
+        "x_train": dataset["frame_train"].to_numpy(dtype=np.float64, copy=False),
+        "y_train": dataset["y_train"],
+        "x_val": dataset["frame_val"].to_numpy(dtype=np.float64, copy=False),
+        "y_val": dataset["y_val"],
+        "x_test": dataset["frame_test"].to_numpy(dtype=np.float64, copy=False),
+        "y_test": dataset["y_test"],
+        "x_oot": dataset["frame_oot"].to_numpy(dtype=np.float64, copy=False),
+        "y_oot": dataset["y_oot"],
+        "feature_names": dataset["feature_names"],
+    }
+    best = run_baseline(data=data) if args.baseline else run_search(data=data)
     print(json.dumps(best, indent=2))
     print(f"val_auc: {best['val_auc']:.6f}")
 

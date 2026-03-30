@@ -1,6 +1,6 @@
 # autoresearch-tabular
 
-This is an experiment to have the LLM do its own research on tabular XGBoost training. The data is from a peer-to-peer lender and it includes credit/bureau information about the applicants. 
+This is an experiment to have the LLM do its own hyperparameter tuning, sampling strategy research, and post-fit feature pruning on tabular XGBoost training. The data is from a peer-to-peer lender and it includes credit/bureau information about the applicants. 
 
 ## Setup
 
@@ -98,28 +98,7 @@ When deciding whether to keep a change, weigh:
 
 Readable, compact training logic is preferred over clever machinery.
 
-## Search Expansion
 
-As the experiment progresses, it is good to expand the search process in targeted ways when the current policy is too narrow.
-
-Useful expansions include:
-
-- more nuanced class-imbalance handling, including searching `scale_pos_weight`
-- controlled combinations of mild undersampling with weighting, when that remains readable and benchmark-oriented
-- smarter local hyperparameter refinement around winning regions, especially for plausible shallow-tree settings
-
-Do not stay trapped in one tiny neighborhood for too long.
-
-After several local follow-up experiments, deliberately reopen the search across the main policy axes again, including:
-
-- `FEATURE_CAPS`
-- `SAMPLING_PLANS`
-- class-weighting choices
-- `HYPERPARAM_GRID`
-
-Use local refinement when a region looks promising, but periodically return to broader exploration so the search does not collapse into repeated tiny nudges around one incumbent.
-
-The goal is to spend more of the fixed budget around credible candidate neighborhoods without turning the script into a large opaque search framework.
 
 ## The First Run
 

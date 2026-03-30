@@ -80,7 +80,7 @@ def load_modeling_frame(
     y_series = pd.to_numeric(frame[PROSPER_TARGET], errors="coerce")
     frame = frame.loc[y_series.notna()].copy().reset_index(drop=True)
     y = y_series.loc[y_series.notna()].astype(np.int64).to_numpy()
-    excluded = {PROSPER_TARGET, SPLIT_COLUMN}
+    excluded = {PROSPER_TARGET, SPLIT_COLUMN, "timestamp"}
     x_frame = frame.drop(columns=list(excluded & set(frame.columns))).copy().reset_index(drop=True)
     return frame, x_frame, y, PROSPER_TARGET
 
