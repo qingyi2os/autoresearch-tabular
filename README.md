@@ -1,6 +1,6 @@
 # autoresearch-tabular
 
-`autoresearch-tabular` is a small fork of [Andrej Karpathy's `autoresearch`](https://github.com/karpathy/autoresearch) and inspired by [`autoresearch-glm`](https://github.com/ajzhanghk/autoresearch-glm/tree/master), adapted for tabular binary classification with XGBoost.
+`autoresearch-tabular` is a small fork of [Andrej Karpathy's `autoresearch`](https://github.com/karpathy/autoresearch), also inspired by [`autoresearch-glm`](https://github.com/ajzhanghk/autoresearch-glm/tree/master), and adapted for tabular binary classification with XGBoost.
 
 This repo focuses on a fixed Prosper benchmark where the main research surface is:
 
